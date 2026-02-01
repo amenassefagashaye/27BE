@@ -1,5 +1,6 @@
 import { serve } from "https://deno.land/std@0.200.0/http/server.ts";
 import { serveDir } from "https://deno.land/std@0.200.0/http/file_server.ts";
+import { createClient } from 'https://esm.sh/@supabase/supabase-js@2.39.0';
 
 // WebSocket connections store
 const connections = new Set<WebSocket>();
@@ -14,6 +15,11 @@ const cache = {
 
 // User sessions
 const sessions = new Map();
+
+// Initialize Supabase client
+const supabaseUrl = "https://yjijuwxbxxhufwglytny.supabase.co";
+const supabaseKey = "sb_secret_q2JYU9KW1FK3HxnFk8Vo5Q_4dLpX552";
+const supabase = createClient(supabaseUrl, supabaseKey);
 
 interface WebSocketMessage {
   type: string;
@@ -34,213 +40,234 @@ async function handleWebSocket(ws: WebSocket) {
   ws.onmessage = async (event) => {
     try {
       const message: WebSocketMessage = JSON.parse(event.data);
-      await handleWebSocketMessage(ws, message);
+      
+      switch (message.type) {
+        case 'auth':
+          // Handle authentication
+          if (message.userType && message.userName) {
+            sessions.set(ws, {
+              userType: message.userType,
+              userName: message.userName,
+              timestamp: Date.now()
+            });
+            
+            // Send initial data from cache
+            ws.send(JSON.stringify({
+              type: 'initial_data',
+              stockItems: cache.stockItems,
+              sales: cache.sales,
+              transactions: cache.transactions
+            }));
+          }
+          break;
+          
+        case 'stock_update':
+          // Update stock in cache
+          cache.stockItems = message.data || [];
+          
+          // Broadcast to all connected clients
+          broadcast({
+            type: 'stock_updated',
+            data: cache.stockItems
+          });
+          break;
+          
+        case 'sale_update':
+          // Add new sale to cache
+          if (message.data) {
+            cache.sales.push({
+              ...message.data,
+              timestamp: Date.now()
+            });
+            
+            // Broadcast to all connected clients
+            broadcast({
+              type: 'sales_updated',
+              data: cache.sales
+            });
+            
+            // Update stock levels in cache
+            if (message.data.items) {
+              updateStockLevels(message.data.items);
+            }
+            
+            // Log to audit trail
+            logAudit('sale_created', message.data);
+          }
+          break;
+          
+        case 'transaction_update':
+          // Add new transaction to cache
+          if (message.data) {
+            cache.transactions.push({
+              ...message.data,
+              timestamp: Date.now()
+            });
+            
+            // Broadcast to all connected clients
+            broadcast({
+              type: 'transactions_updated',
+              data: cache.transactions
+            });
+            
+            // Log to audit trail
+            logAudit('transaction_created', message.data);
+          }
+          break;
+          
+        case 'sync_request':
+          // Send current cache state
+          ws.send(JSON.stringify({
+            type: 'sync_response',
+            ...cache
+          }));
+          break;
+          
+        default:
+          console.log('Unknown message type:', message.type);
+      }
     } catch (error) {
       console.error('Error processing WebSocket message:', error);
+      ws.send(JSON.stringify({
+        type: 'error',
+        message: 'Failed to process message'
+      }));
     }
   };
   
   ws.onclose = () => {
     console.log('WebSocket connection closed');
     connections.delete(ws);
+    sessions.delete(ws);
   };
   
   ws.onerror = (error) => {
     console.error('WebSocket error:', error);
     connections.delete(ws);
+    sessions.delete(ws);
   };
 }
 
-async function handleWebSocketMessage(ws: WebSocket, message: WebSocketMessage) {
-  switch (message.type) {
-    case 'auth':
-      // Store user session
-      sessions.set(ws, {
-        userType: message.userType,
-        userName: message.userName,
-        authenticated: true
-      });
-      ws.send(JSON.stringify({ type: 'auth_success', message: 'Authenticated' }));
-      break;
-      
-    case 'stock_update':
-      // Broadcast to all connected clients
-      broadcast({
-        type: 'stock_update',
-        data: message.data
-      });
-      break;
-      
-    case 'sale_update':
-      broadcast({
-        type: 'sale_update',
-        data: message.data
-      });
-      break;
-      
-    case 'audit_update':
-      broadcast({
-        type: 'audit_update',
-        data: message.data
-      });
-      break;
-      
-    case 'sync_request':
-      // Send current cache to requesting client
-      ws.send(JSON.stringify({
-        type: 'sync_response',
-        data: cache
-      }));
-      break;
-      
-    case 'sync_response':
-      // Update cache from other client
-      Object.assign(cache, message.data);
-      break;
-  }
-}
-
-function broadcast(message: WebSocketMessage) {
-  const messageStr = JSON.stringify(message);
-  connections.forEach(ws => {
-    if (ws.readyState === WebSocket.OPEN) {
-      ws.send(messageStr);
+function broadcast(message: any) {
+  const data = JSON.stringify(message);
+  connections.forEach(conn => {
+    if (conn.readyState === WebSocket.OPEN) {
+      conn.send(data);
     }
   });
 }
 
-// HTTP Request Handler
-async function handleRequest(request: Request): Promise<Response> {
-  const url = new URL(request.url);
-  
-  // Handle WebSocket upgrade
-  if (url.pathname === '/ws') {
-    if (request.headers.get('upgrade') === 'websocket') {
-      const { socket, response } = Deno.upgradeWebSocket(request);
-      handleWebSocket(socket);
-      return response;
+function updateStockLevels(items: any[]) {
+  items.forEach(item => {
+    const stockItem = cache.stockItems.find((s: any) => s.id === item.id);
+    if (stockItem) {
+      stockItem.quantity -= item.quantity;
     }
-    return new Response('Expected WebSocket upgrade', { status: 400 });
+  });
+}
+
+function logAudit(action: string, data: any) {
+  const auditEntry = {
+    action,
+    data,
+    timestamp: Date.now()
+  };
+  cache.audit.push(auditEntry);
+  
+  // Broadcast audit update
+  broadcast({
+    type: 'audit_updated',
+    data: cache.audit
+  });
+}
+
+async function handleRequest(req: Request) {
+  const url = new URL(req.url);
+  
+  // Handle WebSocket connections
+  if (req.headers.get("upgrade") === "websocket") {
+    const { socket, response } = Deno.upgradeWebSocket(req);
+    handleWebSocket(socket);
+    return response;
   }
   
-  // API endpoints
+  // Handle API endpoints
   if (url.pathname.startsWith('/api/')) {
-    return handleAPI(request);
+    const path = url.pathname.replace('/api/', '');
+    
+    switch (path) {
+      case 'health':
+        return new Response(JSON.stringify({ 
+          status: 'ok',
+          connections: connections.size,
+          cacheSizes: {
+            stockItems: cache.stockItems.length,
+            sales: cache.sales.length,
+            transactions: cache.transactions.length,
+            audit: cache.audit.length
+          }
+        }), {
+          headers: { 'Content-Type': 'application/json' }
+        });
+        
+      case 'clear-cache':
+        if (req.method === 'POST') {
+          cache.stockItems = [];
+          cache.sales = [];
+          cache.transactions = [];
+          cache.audit = [];
+          
+          broadcast({ type: 'cache_cleared' });
+          
+          return new Response(JSON.stringify({ 
+            message: 'Cache cleared successfully'
+          }), {
+            headers: { 'Content-Type': 'application/json' }
+          });
+        }
+        break;
+        
+      case 'test-supabase':
+        try {
+          // Test Supabase connection
+          const { data, error } = await supabase.from('test_table').select('*').limit(1);
+          
+          if (error) throw error;
+          
+          return new Response(JSON.stringify({ 
+            status: 'connected',
+            message: 'Supabase connection successful',
+            data
+          }), {
+            headers: { 'Content-Type': 'application/json' }
+          });
+        } catch (error) {
+          return new Response(JSON.stringify({ 
+            status: 'error',
+            message: 'Failed to connect to Supabase',
+            error: error.message
+          }), {
+            status: 500,
+            headers: { 'Content-Type': 'application/json' }
+          });
+        }
+    }
+    
+    return new Response(JSON.stringify({ error: 'API endpoint not found' }), {
+      status: 404,
+      headers: { 'Content-Type': 'application/json' }
+    });
   }
   
-  // Serve static files from public directory
-  return serveDir(request, {
-    fsRoot: 'public',
+  // Serve static files (for frontend)
+  return serveDir(req, {
+    fsRoot: "public",
+    urlRoot: "",
     showDirListing: true,
     enableCors: true
   });
 }
 
-async function handleAPI(request: Request): Promise<Response> {
-  const url = new URL(request.url);
-  const path = url.pathname;
-  
-  // CORS headers
-  const headers = {
-    'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type, Authorization',
-    'Content-Type': 'application/json'
-  };
-  
-  // Handle preflight requests
-  if (request.method === 'OPTIONS') {
-    return new Response(null, { headers });
-  }
-  
-  try {
-    // Mock API endpoints (in production, connect to Supabase)
-    switch (path) {
-      case '/api/stock':
-        if (request.method === 'GET') {
-          return new Response(JSON.stringify(cache.stockItems), { headers });
-        } else if (request.method === 'POST') {
-          const data = await request.json();
-          cache.stockItems.push(data);
-          broadcast({ type: 'stock_update', data });
-          return new Response(JSON.stringify({ success: true }), { headers });
-        }
-        break;
-        
-      case '/api/sales':
-        if (request.method === 'GET') {
-          return new Response(JSON.stringify(cache.sales), { headers });
-        } else if (request.method === 'POST') {
-          const data = await request.json();
-          cache.sales.push(data);
-          broadcast({ type: 'sale_update', data });
-          return new Response(JSON.stringify({ success: true }), { headers });
-        }
-        break;
-        
-      case '/api/audit':
-        if (request.method === 'GET') {
-          return new Response(JSON.stringify(cache.audit), { headers });
-        } else if (request.method === 'POST') {
-          const data = await request.json();
-          cache.audit.push(data);
-          broadcast({ type: 'audit_update', data });
-          return new Response(JSON.stringify({ success: true }), { headers });
-        }
-        break;
-        
-      case '/api/settings':
-        if (request.method === 'GET') {
-          const settings = {
-            lowStockThreshold: 20,
-            expiryWarningDays: 60,
-            defaultMarkup: 50.0,
-            defaultVAT: 15.0,
-            overstockAlert: 150,
-            profitMarginAlert: 10
-          };
-          return new Response(JSON.stringify(settings), { headers });
-        }
-        break;
-        
-      case '/api/login':
-        if (request.method === 'POST') {
-          const { loginType, password } = await request.json();
-          
-          // Simple authentication (in production, use proper auth)
-          if ((loginType === 'user' && password === '123456') || 
-              (loginType === 'admin' && password === 'esubalew2123')) {
-            return new Response(JSON.stringify({
-              success: true,
-              userType: loginType,
-              userName: loginType === 'admin' ? 'Esubalew Biyazin' : 'User'
-            }), { headers });
-          } else {
-            return new Response(JSON.stringify({
-              success: false,
-              message: 'Invalid credentials'
-            }), { status: 401, headers });
-          }
-        }
-        break;
-    }
-    
-    return new Response(JSON.stringify({ error: 'Not found' }), { 
-      status: 404, 
-      headers 
-    });
-    
-  } catch (error) {
-    console.error('API error:', error);
-    return new Response(JSON.stringify({ error: 'Internal server error' }), {
-      status: 500,
-      headers
-    });
-  }
-}
-
-// Start server
 const PORT = 8000;
 console.log(`Server running on http://localhost:${PORT}`);
-
 serve(handleRequest, { port: PORT });
